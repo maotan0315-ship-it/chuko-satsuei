@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>中古撮影</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Hiragino Sans", sans-serif; background: #f4f4f4; color: #222; }
+  header { background: #263238; color: #fff; padding: 12px 16px; }
+  header .id { font-size: 26px; font-weight: bold; letter-spacing: 1px; }
+  header .name { font-size: 14px; opacity: .85; }
+  main { padding: 12px 16px 120px; }
+  .hint { background: #fff3cd; border-radius: 8px; padding: 10px 12px; font-size: 15px; margin-bottom: 12px; }
+  .shoot { display: block; width: 100%; padding: 26px 0; border-radius: 14px; background: #1e88e5; color: #fff;
+           font-size: 24px; font-weight: bold; text-align: center; -webkit-user-select: none; user-select: none; }
+  .shoot:active { background: #1565c0; }
+  .shoot input { display: none; }
+  .stat { margin: 12px 0; font-size: 16px; }
+  .stat b { font-size: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .ph { position: relative; aspect-ratio: 1; background: #ddd; border-radius: 8px; overflow: hidden; }
+  .ph img { width: 100%; height: 100%; object-fit: cover; }
+  .ph span { position: absolute; left: 0; right: 0; bottom: 0; font-size: 11px; padding: 3px 4px; color: #fff; background: rgba(0,0,0,.6); }
+  .ph.sent span { background: rgba(46,125,50,.85); }
+  .ph.err span { background: rgba(198,40,40,.85); }
+  footer { position: fixed; left: 0; right: 0; bottom: 0; padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); background: #fff; box-shadow: 0 -2px 8px rgba(0,0,0,.1); }
+  #done { width: 100%; padding: 18px 0; font-size: 20px; font-weight: bold; border: 0; border-radius: 12px; background: #2e7d32; color: #fff; }
+  #done:disabled { background: #bbb; }
+  #msg { font-size: 13px; color: #c62828; min-height: 1em; margin-bottom: 6px; }
+  .finished { padding: 40px 16px; text-align: center; font-size: 22px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="id" id="hid"></div>
+  <div class="name" id="hname"></div>
+</header>
+<main id="main">
+  <div class="hint" id="hint"></div>
+  <label class="shoot">📷 撮影する<input type="file" id="cam" accept="image/jpeg" capture="environment"></label>
+  <div class="stat">送信済 <b id="nSent">0</b> 枚 ／ 未送信 <b id="nPend">0</b> 枚</div>
+  <div class="grid" id="grid"></div>
+</main>
+<footer id="foot">
+  <div id="msg"></div>
+  <button id="done" disabled>撮影完了</button>
+</footer>
+
+<script>
+// 保存先のGAS Webアプリ（デプロイIDを固定しているのでURLは変わらない）
+var GAS_URL = 'https://script.google.com/macros/s/AKfycbx5nXfgKBb1fmn6QFQzw_hbc5JjQq0FdOzRpW2YnsoFN3nRoyhEa2NTGDAN_A6bACH1/exec';
+var LONG_SIDE = 2000, QUALITY = 0.85, TIMEOUT_MS = 60000;
+
+// 管理IDと合言葉はURLの # 以降から読む（# 以降はこのページのサーバーに送られない）
+var D = (function () {
+  var p = new URLSearchParams(location.hash.slice(1));
+  return { id: p.get('id') || '', k: p.get('k') || '', name: '' };
+})();
+var serverCount = 0;          // Driveに保存済みの枚数（info取得時点）
+var sentUuids = [];           // この画面で送信成功したUUID
+var pending = [];             // {uuid, b64, thumb, meta, attempt}
+var sending = false, retryTimer = null, fatal = false;
+var db = null;
+
+document.getElementById('hid').textContent = D.id || '—';
+
+// GASへ送る。Content-Type を付けない（text/plain）ことでCORSの事前確認を避ける
+function api(action, body) {
+  body.action = action; body.id = D.id; body.k = D.k;
+  var ctrl = window.AbortController ? new AbortController() : null;
+  var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, TIMEOUT_MS);
+  return fetch(GAS_URL, { method: 'POST', body: JSON.stringify(body), signal: ctrl ? ctrl.signal : undefined, redirect: 'follow' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function (r) {
+      clearTimeout(timer);
+      if (r.ok === false && r.error) { var e = new Error(r.error); e.fatal = !!r.fatal; throw e; }
+      return r;
+    }, function (e) { clearTimeout(timer); throw e.name === 'AbortError' ? new Error('タイムアウト') : e; });
+}
+
+// ---- 撮影開始時刻（再読込しても最初の時刻を残す） ----
+var openedKey = 'opened_' + D.id;
+var openedAt = safeGet(openedKey);
+if (!openedAt) { openedAt = new Date().toISOString(); safeSet(openedKey, openedAt); }
+function safeGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function safeSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+
+// ---- IndexedDB（未送信写真を端末に保持） ----
+// iOSはカメラ起動でページが裏に回ると接続を閉じるため、毎回つなぎ直せるようにする。
+// 端末保存の失敗で送信を止めないよう、ここの関数は決して reject しない
+function openDb() {
+  return new Promise(function (resolve) {
+    try {
+      var req = indexedDB.open('chuko_poc', 1);
+      req.onupgradeneeded = function () { req.result.createObjectStore('pending', { keyPath: 'uuid' }); };
+      req.onsuccess = function () {
+        var d = req.result;
+        d.onclose = function () { if (db === d) db = null; };
+        d.onversionchange = function () { d.close(); if (db === d) db = null; };
+        resolve(d);
+      };
+      req.onerror = function () { resolve(null); };
+    } catch (e) { resolve(null); }
+  });
+}
+function withStore(mode, fn, fallback) {
+  function run(retry) {
+    var ready = db ? Promise.resolve(db) : openDb().then(function (d) { db = d; return d; });
+    return ready.then(function (d) {
+      if (!d) return fallback;
+      return new Promise(function (res) {
+        try {
+          var tx = d.transaction('pending', mode);
+          var out = fn(tx.objectStore('pending'));
+          tx.oncomplete = function () { res(out && out.value !== undefined ? out.value : fallback); };
+          tx.onerror = tx.onabort = function () { res(fallback); };
+        } catch (e) {
+          // 「接続が閉じている」等。つなぎ直して1回だけやり直す
+          if (db === d) db = null;
+          res(retry ? run(false) : fallback);
+        }
+      });
+    });
+  }
+  return run(true);
+}
+function dbPut(rec) { return withStore('readwrite', function (s) { s.put(rec); }); }
+function dbDel(uuid) { return withStore('readwrite', function (s) { s.delete(uuid); }); }
+function dbLoad() {
+  return withStore('readonly', function (s) {
+    var box = { value: [] };
+    s.openCursor().onsuccess = function (e) {
+      var c = e.target.result;
+      if (c) { if (c.value.id === D.id) box.value.push(c.value); c.continue(); }
+    };
+    return box;
+  }, []);
+}
+
+// ---- 画面 ----
+function render() {
+  var total = serverCount;   // サーバーが返した保存済み枚数
+  document.getElementById('nSent').textContent = total;
+  document.getElementById('nPend').textContent = pending.length;
+  document.getElementById('hint').textContent = (total + pending.length === 0)
+    ? '1枚目は「ラベルと商品」を一緒に写してください（確認用）'
+    : '商品写真を続けて撮影してください';
+  document.getElementById('done').disabled = fatal || pending.length > 0 || total === 0;
+}
+function addThumb(uuid, thumb, state, label) {
+  var div = document.createElement('div');
+  div.className = 'ph ' + state; div.id = 'ph_' + uuid;
+  div.innerHTML = '<img><span></span>';
+  div.querySelector('img').src = thumb;
+  div.querySelector('span').textContent = label;
+  document.getElementById('grid').prepend(div);
+}
+function setThumb(uuid, state, label) {
+  var div = document.getElementById('ph_' + uuid);
+  if (!div) return;
+  div.className = 'ph ' + state;
+  div.querySelector('span').textContent = label;
+}
+function showMsg(t) { document.getElementById('msg').textContent = t || ''; }
+
+// ---- 撮影 → 縮小 → 端末保存 → 送信キューへ ----
+document.getElementById('cam').addEventListener('change', function (ev) {
+  var file = ev.target.files && ev.target.files[0];
+  ev.target.value = '';
+  if (!file) return;
+  processFile(file).catch(function (e) { showMsg('画像の処理に失敗しました: ' + e.message); pump(); });
+});
+
+function processFile(file) {
+  return loadImage(file).then(function (img) {
+    var w = img.naturalWidth, h = img.naturalHeight;
+    var scale = Math.min(1, LONG_SIDE / Math.max(w, h));
+    var cw = Math.round(w * scale), ch = Math.round(h * scale);
+    var b64 = drawJpeg(img, cw, ch, QUALITY);
+    var ts = Math.min(1, 240 / Math.max(w, h));
+    var thumb = 'data:image/jpeg;base64,' + drawJpeg(img, Math.round(w * ts), Math.round(h * ts), 0.6);
+    URL.revokeObjectURL(img.src);
+    var rec = {
+      uuid: newUuid(), id: D.id, b64: b64, thumb: thumb, attempt: 0,
+      meta: { srcSize: w + 'x' + h, outSize: cw + 'x' + ch, clientTime: new Date().toISOString() }
+    };
+    pending.push(rec);
+    addThumb(rec.uuid, thumb, '', '未送信');
+    render();
+    return dbPut(rec).then(pump, pump);
+  });
+}
+function loadImage(file) {
+  return new Promise(function (resolve, reject) {
+    var img = new Image();
+    img.onload = function () { resolve(img); };
+    img.onerror = function () { reject(new Error('画像を読めません')); };
+    img.src = URL.createObjectURL(file);
+  });
+}
+function drawJpeg(img, w, h, q) {
+  var c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(img, 0, 0, w, h);
+  var url = c.toDataURL('image/jpeg', q);
+  c.width = c.height = 0;   // iOSのcanvasメモリ解放
+  return url.slice(url.indexOf(',') + 1);
+}
+function newUuid() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  var b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  var h = Array.prototype.map.call(b, function (x) { return ('0' + x.toString(16)).slice(-2); }).join('');
+  return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
+}
+
+// ---- 1枚ずつ順番に送信。失敗したら自動再送（同じUUIDはサーバー側で二重保存されない） ----
+function pump() {
+  if (sending || fatal || !pending.length) return;
+  clearTimeout(retryTimer);
+  sending = true;
+  var rec = pending[0];
+  rec.attempt++;
+  rec.meta.attempt = rec.attempt;
+  setThumb(rec.uuid, '', '送信中…');
+  api('upload', { uuid: rec.uuid, b64: rec.b64, meta: rec.meta }).then(function (r) {
+    pending.shift();
+    sentUuids.push(rec.uuid);
+    serverCount = Math.max(serverCount, r.count);
+    setThumb(rec.uuid, 'sent', r.name.replace(D.id + '_', ''));
+    showMsg('');
+    return dbDel(rec.uuid).then(function () { sending = false; render(); pump(); });
+  }, function (err) { onFail(rec, err); });
+}
+function onFail(rec, err) {
+  sending = false;
+  if (err && err.fatal) { stopFatal(err.message); setThumb(rec.uuid, 'err', '送信不可'); return; }
+  setThumb(rec.uuid, 'err', '再送待ち(' + rec.attempt + ')');
+  showMsg('送信に失敗しました。自動で再送します（' + ((err && err.message) || err) + '）');
+  var wait = Math.min(30000, 3000 * Math.pow(2, Math.min(rec.attempt - 1, 4)));
+  retryTimer = setTimeout(pump, wait);
+  render();
+}
+function stopFatal(m) {
+  fatal = true;
+  showMsg(m);
+  render();
+}
+window.addEventListener('online', function () { loadInfo(); pump(); });
+document.addEventListener('visibilitychange', function () { if (!document.hidden) pump(); });
+window.addEventListener('pageshow', pump);
+window.addEventListener('beforeunload', function (e) { if (pending.length) { e.preventDefault(); e.returnValue = ''; } });
+
+// ---- 撮影完了 ----
+document.getElementById('done').addEventListener('click', function () {
+  if (pending.length) return;
+  this.disabled = true; showMsg('確認中…');
+  api('complete', { uuids: sentUuids, openedAt: openedAt }).then(function (r) {
+    if (!r.ok) {
+      showMsg(r.message || ('未保存の写真があります（' + (r.missing || []).length + '枚）。もう一度お試しください'));
+      render();
+      return;
+    }
+    try { localStorage.removeItem(openedKey); } catch (e) {}
+    document.getElementById('main').innerHTML = '<div class="finished">✅ ' + D.id + '<br>撮影完了（' + r.count + '枚）</div>';
+    document.getElementById('foot').style.display = 'none';
+  }, function (err) {
+    if (err && err.fatal) return stopFatal(err.message);
+    showMsg('完了処理に失敗しました: ' + err.message); render();
+  });
+});
+
+// ---- 起動：商品情報の取得と、前回の未送信分の復元・再送 ----
+var infoLoaded = false;
+function loadInfo() {
+  if (infoLoaded || fatal) return;
+  api('info', {}).then(function (r) {
+    infoLoaded = true;
+    D.name = r.name; serverCount = Math.max(serverCount, r.count);
+    document.getElementById('hname').textContent = r.name;
+    render();
+  }, function (err) {
+    if (err && err.fatal) return stopFatal(err.message);
+    document.getElementById('hname').textContent = '（通信待ち：撮影は続けられます）';
+    setTimeout(loadInfo, 5000);
+  });
+}
+
+if (!/^T\d{5}$/.test(D.id) || !D.k) {
+  stopFatal('このQRコードは無効です');
+} else {
+  loadInfo();
+  openDb().then(function (d) {
+    db = d;
+    if (!db) showMsg('この端末では未送信写真を保存できません。送信が終わるまで画面を閉じないでください');
+    return dbLoad();
+  }).then(function (list) {
+    list.sort(function (a, b) { return a.meta.clientTime < b.meta.clientTime ? -1 : 1; });
+    list.forEach(function (rec) { pending.push(rec); addThumb(rec.uuid, rec.thumb, 'err', '再送待ち'); });
+    render();
+    pump();
+  });
+}
+</script>
+</body>
+</html>
