@@ -106,28 +106,37 @@ function openDb() {
     } catch (e) { resolve(null); }
   });
 }
-function withStore(mode, fn, fallback) {
+// 結果は {ok, value}。開始時の例外だけでなく、コミット時の中断(abort)でもつなぎ直して1回やり直す
+function withStore(mode, fn) {
   function run(retry) {
     var ready = db ? Promise.resolve(db) : openDb().then(function (d) { db = d; return d; });
     return ready.then(function (d) {
-      if (!d) return fallback;
+      if (!d) return { ok: false };
       return new Promise(function (res) {
+        function again() { if (db === d) { try { d.close(); } catch (e) {} db = null; } res(retry ? run(false) : { ok: false }); }
         try {
           var tx = d.transaction('pending', mode);
-          var out = fn(tx.objectStore('pending'));
-          tx.oncomplete = function () { res(out && out.value !== undefined ? out.value : fallback); };
-          tx.onerror = tx.onabort = function () { res(fallback); };
+          var out = fn(tx.objectStore('pending')) || {};
+          tx.oncomplete = function () { res({ ok: true, value: out.value }); };
+          tx.onerror = tx.onabort = again;
         } catch (e) {
-          // 「接続が閉じている」等。つなぎ直して1回だけやり直す
-          if (db === d) db = null;
-          res(retry ? run(false) : fallback);
+          again();   // 「接続が閉じている」等
         }
       });
     });
   }
   return run(true);
 }
-function dbPut(rec) { return withStore('readwrite', function (s) { s.put(rec); }); }
+// 書き込み後に読み戻して、本当に端末に残ったかを確かめる
+function dbPut(rec) {
+  return withStore('readwrite', function (s) { s.put(rec); }).then(function () {
+    return withStore('readonly', function (s) {
+      var box = { value: false };
+      s.count(rec.uuid).onsuccess = function (e) { box.value = e.target.result === 1; };
+      return box;
+    });
+  }).then(function (r) { return r.ok && r.value === true; });
+}
 function dbDel(uuid) { return withStore('readwrite', function (s) { s.delete(uuid); }); }
 function dbLoad() {
   return withStore('readonly', function (s) {
@@ -137,8 +146,11 @@ function dbLoad() {
       if (c) { if (c.value.id === D.id) box.value.push(c.value); c.continue(); }
     };
     return box;
-  }, []);
+  }).then(function (r) { return r.value || []; });
 }
+// カメラから戻るたびに古い接続を捨てて、次の保存で新しくつなぐ
+function resetDb() { if (db) { try { db.close(); } catch (e) {} db = null; } }
+if (navigator.storage && navigator.storage.persist) { navigator.storage.persist().catch(function () {}); }
 
 // ---- 画面 ----
 function render() {
@@ -168,6 +180,7 @@ function showMsg(t) { document.getElementById('msg').textContent = t || ''; }
 
 // ---- 撮影 → 縮小 → 端末保存 → 送信キューへ ----
 document.getElementById('cam').addEventListener('change', function (ev) {
+  resetDb();   // カメラから戻った直後は接続が閉じかけていることがある
   var file = ev.target.files && ev.target.files[0];
   ev.target.value = '';
   if (!file) return;
@@ -190,7 +203,14 @@ function processFile(file) {
     pending.push(rec);
     addThumb(rec.uuid, thumb, '', '未送信');
     render();
-    return dbPut(rec).then(pump, pump);
+    return dbPut(rec).then(function (stored) {
+      rec.meta.stored = stored;   // ログに残して、端末保存の失敗を後から追えるようにする
+      if (!stored) {
+        setThumb(rec.uuid, 'err', '端末保存✕');
+        showMsg('端末に保存できなかった写真があります。送信が終わるまで画面を閉じないでください');
+      }
+      pump();
+    });
   });
 }
 function loadImage(file) {
@@ -250,7 +270,7 @@ function stopFatal(m) {
   render();
 }
 window.addEventListener('online', function () { loadInfo(); pump(); });
-document.addEventListener('visibilitychange', function () { if (!document.hidden) pump(); });
+document.addEventListener('visibilitychange', function () { if (!document.hidden) { resetDb(); pump(); } });
 window.addEventListener('pageshow', pump);
 window.addEventListener('beforeunload', function (e) { if (pending.length) { e.preventDefault(); e.returnValue = ''; } });
 
@@ -299,7 +319,11 @@ if (!/^T\d{5}$/.test(D.id) || !D.k) {
     return dbLoad();
   }).then(function (list) {
     list.sort(function (a, b) { return a.meta.clientTime < b.meta.clientTime ? -1 : 1; });
-    list.forEach(function (rec) { pending.push(rec); addThumb(rec.uuid, rec.thumb, 'err', '再送待ち'); });
+    list.forEach(function (rec) {
+      rec.meta.restored = true;   // 再読み込み後に端末から復元して送った印
+      pending.push(rec);
+      addThumb(rec.uuid, rec.thumb, 'err', '再送待ち');
+    });
     render();
     pump();
   });
