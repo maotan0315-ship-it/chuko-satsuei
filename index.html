@@ -51,7 +51,7 @@
 
 <script>
 // 保存先のGAS Webアプリ（デプロイIDを固定しているのでURLは変わらない）
-var GAS_URL = 'https://script.google.com/macros/s/AKfycbx5nXfgKBb1fmn6QFQzw_hbc5JjQq0FdOzRpW2YnsoFN3nRoyhEa2NTGDAN_A6bACH1/exec';
+var GAS_URL = 'https://script.google.com/macros/s/AKfycby9Va6nOYst4Z1XzlRoFndV2hMHP-sqdIzGC0VmjSOQGdB6cVOkzs_2ZDREtfDg2jcy/exec';
 var LONG_SIDE = 2000, QUALITY = 0.85, TIMEOUT_MS = 60000;
 
 // 管理IDと合言葉はURLの # 以降から読む（# 以降はこのページのサーバーに送られない）
@@ -309,7 +309,7 @@ function loadInfo() {
   });
 }
 
-if (!/^T\d{5}$/.test(D.id) || !D.k) {
+if (!/^U\d{5}$/.test(D.id) || !D.k) {
   stopFatal('このQRコードは無効です');
 } else {
   loadInfo();
