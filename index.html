@@ -31,6 +31,10 @@
   #done:disabled { background: #bbb; }
   #msg { font-size: 13px; color: #c62828; min-height: 1em; margin-bottom: 6px; }
   .finished { padding: 40px 16px; text-align: center; font-size: 22px; }
+  .more { display: block; width: 100%; margin-top: 24px; padding: 18px 0; font-size: 20px; font-weight: bold; border: 2px solid #1e88e5;
+          border-radius: 12px; background: #fff; color: #1e88e5; }
+  .more:disabled { opacity: .5; }
+  .note { margin-top: 8px; font-size: 14px; color: #666; text-align: center; }
 </style>
 </head>
 <body>
@@ -285,13 +289,31 @@ document.getElementById('done').addEventListener('click', function () {
       return;
     }
     try { localStorage.removeItem(openedKey); } catch (e) {}
-    document.getElementById('main').innerHTML = '<div class="finished">✅ ' + D.id + '<br>撮影完了（' + r.count + '枚）</div>';
-    document.getElementById('foot').style.display = 'none';
+    showFinished(r.count);
   }, function (err) {
     if (err && err.fatal) return stopFatal(err.message);
     showMsg('完了処理に失敗しました: ' + err.message); render();
   });
 });
+
+// ---- 撮影完了の画面。撮り忘れがあれば撮影待ちに戻して追加できる ----
+function showFinished(count) {
+  document.getElementById('main').innerHTML =
+    '<div class="finished">✅ ' + D.id + '<br>撮影完了（' + count + '枚）</div>' +
+    '<button class="more" id="more">📷 追加で撮影する</button>' +
+    '<div class="note">撮り忘れがあるときだけ押してください。続きの番号で保存されます</div>';
+  document.getElementById('foot').style.display = 'none';
+  document.getElementById('more').addEventListener('click', function () {
+    var btn = this;
+    btn.disabled = true; btn.textContent = '準備中…';
+    api('reopen', {}).then(function () {
+      location.reload();
+    }, function (err) {
+      btn.disabled = false; btn.textContent = '📷 追加で撮影する';
+      alert('追加撮影を始められませんでした: ' + err.message);
+    });
+  });
+}
 
 // ---- 起動：商品情報の取得と、前回の未送信分の復元・再送 ----
 var infoLoaded = false;
@@ -301,6 +323,7 @@ function loadInfo() {
     infoLoaded = true;
     D.name = r.name; serverCount = Math.max(serverCount, r.count);
     document.getElementById('hname').textContent = r.name;
+    if (r.done && !pending.length) return showFinished(r.count);
     render();
   }, function (err) {
     if (err && err.fatal) return stopFatal(err.message);
