@@ -5,34 +5,48 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
-<title>ISBN読み取り試作</title>
+<title>本ISBN読み取り</title>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: -apple-system, "Hiragino Sans", sans-serif; background: #f4f4f4; color: #222; }
-  header { background: #b71c1c; color: #fff; padding: 12px 16px; font-size: 16px; font-weight: bold; }
+  header { background: #1565c0; color: #fff; padding: 12px 16px; font-size: 16px; font-weight: bold; }
   main { padding: 12px 16px 60px; }
+  .boxrow { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .boxrow label { font-weight: bold; white-space: nowrap; }
+  input[type=text] { flex: 1; min-width: 0; padding: 12px; font-size: 20px; border: 2px solid #999; border-radius: 10px; background: #fff; }
   .cam { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 12px; overflow: hidden; }
   .cam video { width: 100%; height: 100%; object-fit: cover; }
   .frame { position: absolute; left: 8%; right: 8%; top: 38%; height: 24%; border: 3px solid #ffeb3b; border-radius: 8px; pointer-events: none; }
   .flash { position: absolute; inset: 0; background: #00e676; opacity: 0; pointer-events: none; transition: opacity .4s; }
   .flash.on { opacity: .7; transition: none; }
-  .btn { display: block; width: 100%; padding: 20px 0; margin-top: 10px; border: 0; border-radius: 14px; background: #1e88e5; color: #fff;
-         font-size: 22px; font-weight: bold; }
+  .btn { display: block; width: 100%; padding: 20px 0; margin-top: 10px; border: 0; border-radius: 14px; background: #1e88e5; color: #fff; font-size: 22px; font-weight: bold; }
   .btn:active { background: #1565c0; }
+  .btn:disabled { background: #b0bec5; }
   .btn.sub { background: #78909c; font-size: 18px; padding: 14px 0; }
-  .row { display: flex; gap: 8px; }
+  .btn.small { width: auto; margin: 0; padding: 12px 18px; font-size: 18px; }
   .msg { margin-top: 8px; font-size: 15px; color: #c62828; min-height: 20px; }
+  .fatal { display: none; margin-top: 8px; padding: 12px; background: #c62828; color: #fff; font-weight: bold; border-radius: 10px; }
   .total { margin: 12px 0 4px; font-size: 18px; }
   .total b { font-size: 48px; }
+  .status { font-size: 14px; color: #555; }
+  .status.warn { color: #e65100; font-weight: bold; }
+  .manual { margin-top: 14px; }
+  .manual .boxrow { margin-bottom: 4px; }
+  .manual .err { color: #c62828; font-size: 14px; min-height: 18px; }
   ul { list-style: none; margin: 0; padding: 0; }
-  li { background: #fff; border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; display: flex; justify-content: space-between; font-size: 16px; }
+  li { background: #fff; border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; display: flex; justify-content: space-between; gap: 8px; font-size: 16px; }
+  li.canceled { opacity: .45; text-decoration: line-through; }
   li .isbn { font-weight: bold; letter-spacing: 1px; }
   li .t { color: #666; font-size: 13px; }
+  li .r { text-align: right; font-size: 14px; min-width: 0; }
+  li .r b { font-size: 16px; }
+  li .pend { color: #e65100; }
 </style>
 </head>
 <body>
-<header>試作：読み取りテスト用（保存されません）</header>
+<header>本ISBN読み取り</header>
 <main>
+  <div class="boxrow"><label for="box">箱番号</label><input type="text" id="box" placeholder="例 A-01" autocomplete="off" autocapitalize="characters"></div>
   <div class="cam">
     <video id="v" playsinline muted autoplay></video>
     <div class="frame"></div>
@@ -40,11 +54,17 @@
   </div>
   <button class="btn" id="start">開始</button>
   <div class="msg" id="msg"></div>
-  <div class="total">合計 <b id="total">0</b> 冊</div>
-  <div class="row">
-    <button class="btn sub" id="undo">直前を取消</button>
-    <button class="btn sub" id="clear">全部クリア</button>
+  <div class="fatal" id="fatal"></div>
+  <div class="total">合計 <b id="total">0</b> 冊 <span class="status" id="status"></span></div>
+  <div class="manual">
+    <div class="boxrow">
+      <input type="text" id="man" inputmode="numeric" placeholder="ISBNを手入力" autocomplete="off" maxlength="17">
+      <button class="btn small" id="manX" type="button">X</button>
+      <button class="btn small" id="manAdd" type="button">追加</button>
+    </div>
+    <div class="err" id="manErr"></div>
   </div>
+  <button class="btn sub" id="undo">直前を取消</button>
   <ul id="list" style="margin-top:10px"></ul>
 </main>
 
@@ -61,95 +81,340 @@ prepareZXingModule({
   },
 });
 
-const detector = new BarcodeDetector({ formats: ["ean_13"] });
-window.__detector = detector;
+const GAS_URL = "https://script.google.com/macros/s/AKfycbzkIpGLyskgxgIrUBHNziBQjgC8IzS6SKha1NuvwaSxVvypiqQxzlK4AgXK-efrbTDYxA/exec";
+const TIMEOUT_MS = 30000;
+const REARM_MS = 1500;       // そのISBNが枠から消えて1.5秒たったら次の冊として読める
+const MAX_ITEMS = 50;
 
-const KEY = "isbn_proto_list";
+const detector = new BarcodeDetector({ formats: ["ean_13"] });
 const $ = id => document.getElementById(id);
 const video = $("v");
-let audioCtx = null, stream = null, running = false;
-let items = [];            // {t, isbn} 古い順
-let lastRaw = null;        // 直前フレームの候補
-const lastHit = {};        // isbn -> 最後に確定した時刻(ms)
+function safeGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function safeSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
-// ISBN-13 判定: 13桁数字・978/979始まり・チェックデジット
+// ---- 合言葉（#k=... を保存。以後は # なしでも動く） ----
+let K = "";
+(function () {
+  const h = new URLSearchParams(location.hash.slice(1)).get("k");
+  if (h) { safeSet("isbn_k", h); try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {} }
+  K = h || safeGet("isbn_k") || "";
+})();
+
+// ---- ISBN ----
 function isIsbn13(s) {
-  if (typeof s !== "string" || !/^\d{13}$/.test(s)) return false;
-  if (!/^97[89]/.test(s)) return false;
+  if (typeof s !== "string" || !/^\d{13}$/.test(s) || !/^97[89]/.test(s)) return false;
   let sum = 0;
   for (let i = 0; i < 12; i++) sum += Number(s[i]) * (i % 2 ? 3 : 1);
   return (10 - sum % 10) % 10 === Number(s[12]);
 }
-window.isIsbn13 = isIsbn13;
-
-function load() {
-  try { const a = JSON.parse(localStorage.getItem(KEY)); if (Array.isArray(a)) items = a; } catch (e) {}
+function isIsbn10(s) {
+  if (!/^\d{9}[\dX]$/.test(s)) return false;
+  let sum = 0;
+  for (let i = 0; i < 10; i++) sum += (10 - i) * (s[i] === "X" ? 10 : Number(s[i]));
+  return sum % 11 === 0;
 }
-function save() {
-  try { localStorage.setItem(KEY, JSON.stringify(items)); } catch (e) {}
+function isbn10to13(s) {
+  const b = "978" + s.slice(0, 9);
+  let sum = 0;
+  for (let i = 0; i < 12; i++) sum += Number(b[i]) * (i % 2 ? 3 : 1);
+  return b + ((10 - sum % 10) % 10);
+}
+// 手入力 -> {isbn} か {error}
+function parseManual(raw) {
+  const s = String(raw).replace(/[\s\-ー－]/g, "").toUpperCase();
+  if (!s) return { error: "ISBNを入力してください" };
+  if (!/^[\dX]+$/.test(s)) return { error: "数字（とXだけ）で入力してください" };
+  if (s.length === 10) {
+    if (!isIsbn10(s)) return { error: "10桁ISBNの検算が合いません。打ち間違いがないか確認してください" };
+    return { isbn: isbn10to13(s) };
+  }
+  if (s.length === 13) {
+    if (!/^\d{13}$/.test(s)) return { error: "13桁にXは使えません" };
+    if (!/^97[89]/.test(s)) return { error: "13桁は978か979で始まる必要があります（バーコード上段のISBNです）" };
+    if (!isIsbn13(s)) return { error: "13桁ISBNの検算が合いません。打ち間違いがないか確認してください" };
+    return { isbn: s };
+  }
+  return { error: "10桁か13桁で入力してください（今 " + s.length + " 桁）" };
+}
+window.__t = { isIsbn13, isIsbn10, isbn10to13, parseManual };
+
+function newUuid() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  const b = crypto.getRandomValues(new Uint8Array(16));
+  b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+  const h = Array.prototype.map.call(b, x => ("0" + x.toString(16)).slice(-2)).join("");
+  return h.slice(0, 8) + "-" + h.slice(8, 12) + "-" + h.slice(12, 16) + "-" + h.slice(16, 20) + "-" + h.slice(20);
 }
 
+// ---- 状態 ----
+let items = [];            // 古い順 {uuid, ts, isbn, box, state:'pending'|'sent', copy, title, canceled, cancelPending}
+let pending = [];          // 送信キュー（古い順）{qid, action, uuid, isbn, box, ts, seq, attempt}
+let seq = Date.now();
+let sending = false, retryTimer = null, fatal = false;
+let db = null;
+let count = { d: "", n: 0 };
+
+function today() { const d = new Date(), p = n => String(n).padStart(2, "0"); return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()); }
+function loadLocal() {
+  try { const a = JSON.parse(safeGet("isbn_items")); if (Array.isArray(a)) items = a; } catch (e) {}
+  try { const c = JSON.parse(safeGet("isbn_count")); if (c && typeof c.n === "number") count = c; } catch (e) {}
+  if (count.d !== today()) count = { d: today(), n: 0 };
+}
+function saveLocal() {
+  if (items.length > MAX_ITEMS) {
+    const keep = [];
+    let extra = items.length - MAX_ITEMS;
+    for (const it of items) {
+      if (extra > 0 && it.state === "sent" && !it.cancelPending) extra--; else keep.push(it);
+    }
+    items = keep;
+  }
+  safeSet("isbn_items", JSON.stringify(items));
+  safeSet("isbn_count", JSON.stringify(count));
+}
+
+// ---- IndexedDB（未送信キューを端末に保持。iOSで接続が切れても繋ぎ直す。決して reject しない） ----
+function openDb() {
+  return new Promise(function (resolve) {
+    try {
+      const req = indexedDB.open("isbn_queue", 1);
+      req.onupgradeneeded = function () { req.result.createObjectStore("q", { keyPath: "qid" }); };
+      req.onsuccess = function () {
+        const d = req.result;
+        d.onclose = function () { if (db === d) db = null; };
+        d.onversionchange = function () { d.close(); if (db === d) db = null; };
+        resolve(d);
+      };
+      req.onerror = function () { resolve(null); };
+    } catch (e) { resolve(null); }
+  });
+}
+function withStore(mode, fn) {
+  function run(retry) {
+    const ready = db ? Promise.resolve(db) : openDb().then(function (d) { db = d; return d; });
+    return ready.then(function (d) {
+      if (!d) return { ok: false };
+      return new Promise(function (res) {
+        function again() { if (db === d) { try { d.close(); } catch (e) {} db = null; } res(retry ? run(false) : { ok: false }); }
+        try {
+          const tx = d.transaction("q", mode);
+          const out = fn(tx.objectStore("q")) || {};
+          tx.oncomplete = function () { res({ ok: true, value: out.value }); };
+          tx.onerror = tx.onabort = again;
+        } catch (e) { again(); }
+      });
+    });
+  }
+  return run(true);
+}
+function dbPut(rec) {
+  return withStore("readwrite", function (s) { s.put(rec); }).then(function () {
+    return withStore("readonly", function (s) {
+      const box = { value: false };
+      s.count(rec.qid).onsuccess = function (e) { box.value = e.target.result === 1; };
+      return box;
+    });
+  }).then(function (r) { return r.ok && r.value === true; });
+}
+function dbDel(qid) { return withStore("readwrite", function (s) { s.delete(qid); }); }
+function dbLoad() {
+  return withStore("readonly", function (s) {
+    const box = { value: [] };
+    s.openCursor().onsuccess = function (e) {
+      const c = e.target.result;
+      if (c) { box.value.push(c.value); c.continue(); }
+    };
+    return box;
+  }).then(function (r) { return r.value || []; });
+}
+function resetDb() { if (db) { try { db.close(); } catch (e) {} db = null; } }
+
+// ---- 通信（Content-Type を付けず CORS の事前確認を避ける） ----
+function api(action, body) {
+  body.action = action; body.k = K;
+  const ctrl = window.AbortController ? new AbortController() : null;
+  const timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, TIMEOUT_MS);
+  return fetch(GAS_URL, { method: "POST", body: JSON.stringify(body), signal: ctrl ? ctrl.signal : undefined, redirect: "follow" })
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (r) {
+      clearTimeout(timer);
+      if (r.ok === false && r.error) { const e = new Error(r.error); e.fatal = !!r.fatal; throw e; }
+      return r;
+    }, function (e) { clearTimeout(timer); throw e.name === "AbortError" ? new Error("タイムアウト") : e; });
+}
+
+// ---- 画面 ----
+function showMsg(t) { $("msg").textContent = t || ""; }
 function render() {
-  $("total").textContent = items.length;
-  const count = {}, nth = [];
-  items.forEach((it, i) => { count[it.isbn] = (count[it.isbn] || 0) + 1; nth[i] = count[it.isbn]; });
+  $("total").textContent = count.n;
+  const st = $("status");
+  st.textContent = pending.length ? "未送信 " + pending.length + " 件" : (items.length ? "送信済み" : "");
+  st.className = "status" + (pending.length ? " warn" : "");
   const ul = $("list");
   ul.textContent = "";
   for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
     const li = document.createElement("li");
+    if (it.canceled) li.className = "canceled";
     const l = document.createElement("span");
-    const t = document.createElement("div"); t.className = "t"; t.textContent = items[i].t;
-    const n = document.createElement("div"); n.className = "isbn"; n.textContent = items[i].isbn;
+    const t = document.createElement("div"); t.className = "t";
+    const d = new Date(it.ts);
+    t.textContent = isNaN(d) ? "" : d.toTimeString().slice(0, 8) + "  箱 " + (it.box || "-");
+    const n = document.createElement("div"); n.className = "isbn"; n.textContent = it.isbn;
     l.append(t, n);
-    const r = document.createElement("span"); r.textContent = nth[i] + "冊目";
+    const r = document.createElement("span"); r.className = "r";
+    if (it.canceled) r.textContent = it.cancelPending ? "取消（送信待ち）" : "取消";
+    else if (it.state === "sent") {
+      const b = document.createElement("b"); b.textContent = it.copy + "冊目";
+      const tt = document.createElement("div"); tt.textContent = it.title || "書名不明";
+      r.append(b, tt);
+    } else { r.className = "r pend"; r.textContent = "送信待ち"; }
     li.append(l, r);
     ul.appendChild(li);
   }
+  $("start").disabled = !K || fatal;
+  $("manAdd").disabled = !K || fatal;
+}
+function stopFatal(m) {
+  fatal = true; running = false;
+  const f = $("fatal"); f.style.display = "block"; f.textContent = "停止しました: " + m;
+  render();
 }
 
+// ---- 送信キュー（1件ずつ。失敗は自動再送。同じUUIDはサーバー側で二重登録されない） ----
+function enqueue(rec) {
+  rec.qid = rec.action === "cancel" ? "c-" + rec.uuid : rec.uuid;
+  rec.seq = ++seq; rec.attempt = 0;
+  pending.push(rec);
+  return dbPut(rec);
+}
+function findItem(uuid) { return items.find(x => x.uuid === uuid); }
+function pump() {
+  if (sending || fatal || !K || !pending.length) return;
+  clearTimeout(retryTimer);
+  sending = true;
+  const rec = pending[0];
+  rec.attempt++;
+  const body = rec.action === "cancel" ? { uuid: rec.uuid } : { uuid: rec.uuid, isbn: rec.isbn, box: rec.box, ts: rec.ts };
+  api(rec.action, body).then(function (r) {
+    pending.shift();
+    const it = findItem(rec.uuid);
+    if (it) {
+      if (rec.action === "add") { it.state = "sent"; it.copy = r.copy; it.title = r.title || ""; }
+      else it.cancelPending = false;
+    }
+    saveLocal(); showMsg("");
+    return dbDel(rec.qid).then(function () { sending = false; render(); pump(); });
+  }, function (err) { onFail(rec, err); });
+  render();
+}
+function onFail(rec, err) {
+  sending = false;
+  if (err && err.fatal) { stopFatal(err.message); return; }
+  showMsg("送信に失敗しました。自動で再送します（" + ((err && err.message) || err) + "）");
+  retryTimer = setTimeout(pump, Math.min(30000, 3000 * Math.pow(2, Math.min(rec.attempt - 1, 4))));
+  render();
+}
+window.addEventListener("online", pump);
+document.addEventListener("visibilitychange", function () { if (!document.hidden) { resetDb(); pump(); } });
+window.addEventListener("pageshow", pump);
+window.addEventListener("beforeunload", function (e) { if (pending.length) { e.preventDefault(); e.returnValue = ""; } });
+
+// ---- 確定 ----
+let audioCtx = null, stream = null, running = false;
 function beep() {
   if (!audioCtx) return;
   try {
     const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-    o.frequency.value = 1000;
-    g.gain.value = 0.2;
+    o.frequency.value = 1000; g.gain.value = 0.2;
     o.connect(g); g.connect(audioCtx.destination);
     o.start(); o.stop(audioCtx.currentTime + 0.1);
   } catch (e) {}
 }
-function flash() {
-  const f = $("flash");
-  f.classList.add("on");
-  setTimeout(() => f.classList.remove("on"), 80);
-}
+function flash() { const f = $("flash"); f.classList.add("on"); setTimeout(() => f.classList.remove("on"), 80); }
 
+function getBox() { return $("box").value.trim(); }
 function accept(isbn) {
-  const now = Date.now();
-  if (lastHit[isbn] && now - lastHit[isbn] < 3000) return;   // 確定後3秒は無視
-  lastHit[isbn] = now;
-  const d = new Date();
-  const p = n => String(n).padStart(2, "0");
-  items.push({ t: `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`, isbn });
-  save(); render(); beep(); flash();
+  if (fatal || !K) return false;
+  const box = getBox();
+  if (!box) { showMsg("箱番号を入力してください"); return false; }
+  if (count.d !== today()) count = { d: today(), n: 0 };
+  const it = { uuid: newUuid(), ts: new Date().toISOString(), isbn, box, state: "pending", copy: 0, title: "", canceled: false, cancelPending: false };
+  items.push(it);
+  count.n++;
+  saveLocal(); render(); beep(); flash();
+  enqueue({ action: "add", uuid: it.uuid, isbn, box, ts: it.ts }).then(function (stored) {
+    if (!stored) showMsg("端末に保存できませんでした。送信が終わるまで画面を閉じないでください");
+    pump();
+  });
+  return true;
 }
 
-// 約6回/秒。前回の detect が終わってから次を予約
+$("undo").addEventListener("click", function () {
+  let i = items.length - 1;
+  while (i >= 0 && items[i].canceled) i--;
+  if (i < 0) return;
+  const it = items[i];
+  const qi = pending.findIndex(q => q.qid === it.uuid);
+  const inFlight = qi === 0 && sending;
+  if (qi >= 0 && !inFlight) {
+    // まだ送っていない: キューから外して一覧からも消す
+    const q = pending.splice(qi, 1)[0];
+    dbDel(q.qid);
+    items.splice(i, 1);
+  } else {
+    // 送信済み（または送信中）: 取消をキューで送る。行は残してグレーアウト
+    it.canceled = true; it.cancelPending = true;
+    enqueue({ action: "cancel", uuid: it.uuid }).then(pump);
+  }
+  if (count.n > 0) count.n--;
+  saveLocal(); render();
+});
+
+// ---- 手入力 ----
+function manualAdd() {
+  const err = $("manErr");
+  err.textContent = "";
+  const r = parseManual($("man").value);
+  if (r.error) { err.textContent = r.error; return; }
+  if (!getBox()) { err.textContent = "箱番号を入力してください"; $("box").focus(); return; }
+  if (accept(r.isbn)) $("man").value = "";
+}
+$("manAdd").addEventListener("click", manualAdd);
+$("man").addEventListener("keydown", function (e) { if (e.key === "Enter") manualAdd(); });
+$("manX").addEventListener("click", function () { const m = $("man"); m.value += "X"; m.focus(); });
+
+$("box").value = safeGet("isbn_box") || "";
+$("box").addEventListener("input", function () { safeSet("isbn_box", $("box").value.trim()); });
+
+// ---- カメラ読み取り ----
+// 同じISBNは「検出されなくなって1.5秒たってから」再び読めたら次の冊。かざしっぱなしでは増えない
+let lastRaw = null;
+const lastSeen = {};       // isbn -> 最後に検出した時刻(ms)
+const armed = {};          // isbn -> false の間は確定済みで、外されるのを待っている
 async function loop() {
   if (!running) return;
   const t0 = performance.now();
   try {
     if (video.readyState >= 2) {
       const res = await detector.detect(video);
-      const cand = res.map(r => r.rawValue).find(isIsbn13) || null;
-      if (cand && cand === lastRaw) { accept(cand); lastRaw = null; }
-      else lastRaw = cand;
+      const now = Date.now();
+      const found = res.map(r => r.rawValue).filter(isIsbn13);
+      for (const k of Object.keys(armed)) if (armed[k] === false && now - (lastSeen[k] || 0) >= REARM_MS) armed[k] = true;
+      const cand = found[0] || null;
+      found.forEach(f => { lastSeen[f] = now; });
+      if (cand && cand === lastRaw && armed[cand] !== false) {
+        if (accept(cand)) armed[cand] = false;
+        lastRaw = null;
+      } else lastRaw = cand;
     }
   } catch (e) { lastRaw = null; }
   setTimeout(loop, Math.max(0, 160 - (performance.now() - t0)));
 }
 
-$("start").addEventListener("click", async () => {
-  $("msg").textContent = "";
+$("start").addEventListener("click", async function () {
+  showMsg("");
+  if (!getBox()) { showMsg("先に箱番号を入力してください"); $("box").focus(); return; }
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!audioCtx && AC) audioCtx = new AC();
@@ -163,22 +428,28 @@ $("start").addEventListener("click", async () => {
     if (!running) { running = true; loop(); }
     $("start").textContent = "再開始";
   } catch (e) {
-    $("msg").textContent = "カメラを使えません: " + (e && e.message || e);
+    showMsg("カメラを使えません: " + (e && e.message || e));
   }
 });
 
-$("undo").addEventListener("click", () => {
-  if (!items.length) return;
-  items.pop(); save(); render();
-});
-$("clear").addEventListener("click", () => {
-  if (!items.length) return;
-  if (!confirm("一覧を全部消します。よろしいですか？")) return;
-  items = []; save(); render();
-});
-
-load();
+// ---- 起動 ----
+loadLocal();
+if (!K) showMsg("専用URLから開いてください（合言葉がありません）。送信は行いません");
 render();
+if (navigator.storage && navigator.storage.persist) { navigator.storage.persist().catch(function () {}); }
+dbLoad().then(function (recs) {
+  recs.sort((a, b) => a.seq - b.seq);
+  const have = new Set(pending.map(q => q.qid));
+  recs.forEach(q => { if (!have.has(q.qid)) pending.push(q); });
+  // 端末の保存が消えていても、一覧に残る未送信分は作り直す（add はUUIDで二重登録されない）
+  const qids = new Set(pending.map(q => q.qid));
+  items.forEach(function (it) {
+    if (it.state === "pending" && !qids.has(it.uuid)) { it.seq = ++seq; pending.push({ qid: it.uuid, action: "add", uuid: it.uuid, isbn: it.isbn, box: it.box, ts: it.ts, seq, attempt: 0 }); }
+    if (it.cancelPending && !qids.has("c-" + it.uuid)) pending.push({ qid: "c-" + it.uuid, action: "cancel", uuid: it.uuid, seq: ++seq, attempt: 0 });
+  });
+  pending.sort((a, b) => a.seq - b.seq);
+  render(); pump();
+});
 </script>
 </body>
 </html>
