@@ -92,11 +92,11 @@ const video = $("v");
 function safeGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 function safeSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
-// ---- 合言葉（#k=... を保存。以後は # なしでも動く） ----
+// ---- 合言葉（#k=... を保存。ブックマーク・ホーム画面追加用に URL の # は残す） ----
 let K = "";
 (function () {
   const h = new URLSearchParams(location.hash.slice(1)).get("k");
-  if (h) { safeSet("isbn_k", h); try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {} }
+  if (h) safeSet("isbn_k", h);
   K = h || safeGet("isbn_k") || "";
 })();
 
