@@ -46,7 +46,7 @@
 <body>
 <header>本ISBN読み取り</header>
 <main>
-  <div class="boxrow"><label for="box">箱番号</label><input type="text" id="box" placeholder="例 A-01" autocomplete="off" autocapitalize="characters"></div>
+  <div class="boxrow"><label for="box">棚番号</label><input type="text" id="box" placeholder="例 A-01" autocomplete="off" autocapitalize="characters"></div>
   <div class="cam">
     <video id="v" playsinline muted autoplay></video>
     <div class="frame"></div>
@@ -259,7 +259,7 @@ function render() {
     const l = document.createElement("span");
     const t = document.createElement("div"); t.className = "t";
     const d = new Date(it.ts);
-    t.textContent = isNaN(d) ? "" : d.toTimeString().slice(0, 8) + "  箱 " + (it.box || "-");
+    t.textContent = isNaN(d) ? "" : d.toTimeString().slice(0, 8) + "  棚 " + (it.box || "-");
     const n = document.createElement("div"); n.className = "isbn"; n.textContent = it.isbn;
     l.append(t, n);
     const r = document.createElement("span"); r.className = "r";
@@ -337,7 +337,7 @@ function getBox() { return $("box").value.trim(); }
 function accept(isbn) {
   if (fatal || !K) return false;
   const box = getBox();
-  if (!box) { showMsg("箱番号を入力してください"); return false; }
+  if (!box) { showMsg("棚番号を入力してください"); return false; }
   if (count.d !== today()) count = { d: today(), n: 0 };
   const it = { uuid: newUuid(), ts: new Date().toISOString(), isbn, box, state: "pending", copy: 0, title: "", canceled: false, cancelPending: false };
   items.push(it);
@@ -377,7 +377,7 @@ function manualAdd() {
   err.textContent = "";
   const r = parseManual($("man").value);
   if (r.error) { err.textContent = r.error; return; }
-  if (!getBox()) { err.textContent = "箱番号を入力してください"; $("box").focus(); return; }
+  if (!getBox()) { err.textContent = "棚番号を入力してください"; $("box").focus(); return; }
   if (accept(r.isbn)) $("man").value = "";
 }
 $("manAdd").addEventListener("click", manualAdd);
@@ -414,7 +414,7 @@ async function loop() {
 
 $("start").addEventListener("click", async function () {
   showMsg("");
-  if (!getBox()) { showMsg("先に箱番号を入力してください"); $("box").focus(); return; }
+  if (!getBox()) { showMsg("先に棚番号を入力してください"); $("box").focus(); return; }
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!audioCtx && AC) audioCtx = new AC();
