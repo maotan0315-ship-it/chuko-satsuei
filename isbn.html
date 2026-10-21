@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>ISBN読み取り試作</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Hiragino Sans", sans-serif; background: #f4f4f4; color: #222; }
+  header { background: #b71c1c; color: #fff; padding: 12px 16px; font-size: 16px; font-weight: bold; }
+  main { padding: 12px 16px 60px; }
+  .cam { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 12px; overflow: hidden; }
+  .cam video { width: 100%; height: 100%; object-fit: cover; }
+  .frame { position: absolute; left: 8%; right: 8%; top: 38%; height: 24%; border: 3px solid #ffeb3b; border-radius: 8px; pointer-events: none; }
+  .flash { position: absolute; inset: 0; background: #00e676; opacity: 0; pointer-events: none; transition: opacity .4s; }
+  .flash.on { opacity: .7; transition: none; }
+  .btn { display: block; width: 100%; padding: 20px 0; margin-top: 10px; border: 0; border-radius: 14px; background: #1e88e5; color: #fff;
+         font-size: 22px; font-weight: bold; }
+  .btn:active { background: #1565c0; }
+  .btn.sub { background: #78909c; font-size: 18px; padding: 14px 0; }
+  .row { display: flex; gap: 8px; }
+  .msg { margin-top: 8px; font-size: 15px; color: #c62828; min-height: 20px; }
+  .total { margin: 12px 0 4px; font-size: 18px; }
+  .total b { font-size: 48px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { background: #fff; border-radius: 8px; padding: 10px 12px; margin-bottom: 6px; display: flex; justify-content: space-between; font-size: 16px; }
+  li .isbn { font-weight: bold; letter-spacing: 1px; }
+  li .t { color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>試作：読み取りテスト用（保存されません）</header>
+<main>
+  <div class="cam">
+    <video id="v" playsinline muted autoplay></video>
+    <div class="frame"></div>
+    <div class="flash" id="flash"></div>
+  </div>
+  <button class="btn" id="start">開始</button>
+  <div class="msg" id="msg"></div>
+  <div class="total">合計 <b id="total">0</b> 冊</div>
+  <div class="row">
+    <button class="btn sub" id="undo">直前を取消</button>
+    <button class="btn sub" id="clear">全部クリア</button>
+  </div>
+  <ul id="list" style="margin-top:10px"></ul>
+</main>
+
+<script type="module">
+// barcode-detector 3.2.3（zxing-wasm を使う ponyfill）。wasm も同バージョンに固定
+import { BarcodeDetector, ZXING_WASM_VERSION, prepareZXingModule }
+  from "https://cdn.jsdelivr.net/npm/barcode-detector@3.2.3/dist/es/ponyfill.js";
+
+prepareZXingModule({
+  overrides: {
+    locateFile: (path, prefix) => path.endsWith(".wasm")
+      ? `https://cdn.jsdelivr.net/npm/zxing-wasm@${ZXING_WASM_VERSION}/dist/reader/${path}`
+      : prefix + path,
+  },
+});
+
+const detector = new BarcodeDetector({ formats: ["ean_13"] });
+window.__detector = detector;
+
+const KEY = "isbn_proto_list";
+const $ = id => document.getElementById(id);
+const video = $("v");
+let audioCtx = null, stream = null, running = false;
+let items = [];            // {t, isbn} 古い順
+let lastRaw = null;        // 直前フレームの候補
+const lastHit = {};        // isbn -> 最後に確定した時刻(ms)
+
+// ISBN-13 判定: 13桁数字・978/979始まり・チェックデジット
+function isIsbn13(s) {
+  if (typeof s !== "string" || !/^\d{13}$/.test(s)) return false;
+  if (!/^97[89]/.test(s)) return false;
+  let sum = 0;
+  for (let i = 0; i < 12; i++) sum += Number(s[i]) * (i % 2 ? 3 : 1);
+  return (10 - sum % 10) % 10 === Number(s[12]);
+}
+window.isIsbn13 = isIsbn13;
+
+function load() {
+  try { const a = JSON.parse(localStorage.getItem(KEY)); if (Array.isArray(a)) items = a; } catch (e) {}
+}
+function save() {
+  try { localStorage.setItem(KEY, JSON.stringify(items)); } catch (e) {}
+}
+
+function render() {
+  $("total").textContent = items.length;
+  const count = {}, nth = [];
+  items.forEach((it, i) => { count[it.isbn] = (count[it.isbn] || 0) + 1; nth[i] = count[it.isbn]; });
+  const ul = $("list");
+  ul.textContent = "";
+  for (let i = items.length - 1; i >= 0; i--) {
+    const li = document.createElement("li");
+    const l = document.createElement("span");
+    const t = document.createElement("div"); t.className = "t"; t.textContent = items[i].t;
+    const n = document.createElement("div"); n.className = "isbn"; n.textContent = items[i].isbn;
+    l.append(t, n);
+    const r = document.createElement("span"); r.textContent = nth[i] + "冊目";
+    li.append(l, r);
+    ul.appendChild(li);
+  }
+}
+
+function beep() {
+  if (!audioCtx) return;
+  try {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = 1000;
+    g.gain.value = 0.2;
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.1);
+  } catch (e) {}
+}
+function flash() {
+  const f = $("flash");
+  f.classList.add("on");
+  setTimeout(() => f.classList.remove("on"), 80);
+}
+
+function accept(isbn) {
+  const now = Date.now();
+  if (lastHit[isbn] && now - lastHit[isbn] < 3000) return;   // 確定後3秒は無視
+  lastHit[isbn] = now;
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  items.push({ t: `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`, isbn });
+  save(); render(); beep(); flash();
+}
+
+// 約6回/秒。前回の detect が終わってから次を予約
+async function loop() {
+  if (!running) return;
+  const t0 = performance.now();
+  try {
+    if (video.readyState >= 2) {
+      const res = await detector.detect(video);
+      const cand = res.map(r => r.rawValue).find(isIsbn13) || null;
+      if (cand && cand === lastRaw) { accept(cand); lastRaw = null; }
+      else lastRaw = cand;
+    }
+  } catch (e) { lastRaw = null; }
+  setTimeout(loop, Math.max(0, 160 - (performance.now() - t0)));
+}
+
+$("start").addEventListener("click", async () => {
+  $("msg").textContent = "";
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!audioCtx && AC) audioCtx = new AC();
+    if (audioCtx) await audioCtx.resume();
+  } catch (e) {}
+  try {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    if (!running) { running = true; loop(); }
+    $("start").textContent = "再開始";
+  } catch (e) {
+    $("msg").textContent = "カメラを使えません: " + (e && e.message || e);
+  }
+});
+
+$("undo").addEventListener("click", () => {
+  if (!items.length) return;
+  items.pop(); save(); render();
+});
+$("clear").addEventListener("click", () => {
+  if (!items.length) return;
+  if (!confirm("一覧を全部消します。よろしいですか？")) return;
+  items = []; save(); render();
+});
+
+load();
+render();
+</script>
+</body>
+</html>
