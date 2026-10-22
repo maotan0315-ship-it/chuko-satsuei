@@ -58,7 +58,7 @@
   <div class="total">合計 <b id="total">0</b> 冊 <span class="status" id="status"></span></div>
   <div class="manual">
     <div class="boxrow">
-      <input type="text" id="man" inputmode="numeric" placeholder="ISBNを手入力" autocomplete="off" maxlength="17">
+      <input type="text" id="man" inputmode="numeric" placeholder="ISBNを手入力" autocomplete="off" maxlength="80">
       <button class="btn small" id="manX" type="button">X</button>
       <button class="btn small" id="manAdd" type="button">追加</button>
     </div>
@@ -122,7 +122,11 @@ function isbn10to13(s) {
 }
 // 手入力 -> {isbn} か {error}
 function parseManual(raw) {
-  const s = String(raw).replace(/[\s\-ー－]/g, "").toUpperCase();
+  // 全角→半角。iPhoneの「テキストをスキャン」で「ISBN4-10-101001-3 C0193 ¥400E」のように拾った場合は ISBN の直後だけ使う
+  let t = String(raw).replace(/[０-９Ａ-Ｚａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).toUpperCase();
+  const m = t.match(/I\s*S\s*B\s*N[\s:：]*([\dX\-‐ー－\s]+)/);
+  if (m) t = m[1];
+  const s = t.replace(/[\s\-‐ー－]/g, "");
   if (!s) return { error: "ISBNを入力してください" };
   if (!/^[\dX]+$/.test(s)) return { error: "数字（とXだけ）で入力してください" };
   if (s.length === 10) {
