@@ -94,11 +94,12 @@ function safeSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
 
 // ---- 合言葉（#k=... を保存。ブックマーク・ホーム画面追加用に URL の # は残す） ----
 let K = "";
-(function () {
+function readKey() {
   const h = new URLSearchParams(location.hash.slice(1)).get("k");
   if (h) safeSet("isbn_k", h);
-  K = h || safeGet("isbn_k") || "";
-})();
+  K = h || safeGet("isbn_k") || K;
+}
+readKey();
 
 // ---- ISBN ----
 function isIsbn13(s) {
@@ -248,7 +249,7 @@ function showMsg(t) { $("msg").textContent = t || ""; }
 function render() {
   $("total").textContent = count.n;
   const st = $("status");
-  st.textContent = pending.length ? "未送信 " + pending.length + " 件" : (items.length ? "送信済み" : "");
+  st.textContent = pending.length ? "未送信 " + pending.length + " 件" + (K ? "" : "（合言葉なし：専用URLで開き直すと送信）") : (items.length ? "送信済み" : "");
   st.className = "status" + (pending.length ? " warn" : "");
   const ul = $("list");
   ul.textContent = "";
@@ -272,8 +273,9 @@ function render() {
     li.append(l, r);
     ul.appendChild(li);
   }
-  $("start").disabled = !K || fatal;
-  $("manAdd").disabled = !K || fatal;
+  // 合言葉が無くても読み取りは止めない（端末に貯めて、専用URLで開き直したら送信）
+  $("start").disabled = fatal;
+  $("manAdd").disabled = fatal;
 }
 function stopFatal(m) {
   fatal = true; running = false;
@@ -286,6 +288,7 @@ function enqueue(rec) {
   rec.qid = rec.action === "cancel" ? "c-" + rec.uuid : rec.uuid;
   rec.seq = ++seq; rec.attempt = 0;
   pending.push(rec);
+  render();
   return dbPut(rec);
 }
 function findItem(uuid) { return items.find(x => x.uuid === uuid); }
@@ -335,7 +338,7 @@ function flash() { const f = $("flash"); f.classList.add("on"); setTimeout(() =>
 
 function getBox() { return $("box").value.trim(); }
 function accept(isbn) {
-  if (fatal || !K) return false;
+  if (fatal) return false;
   const box = getBox();
   if (!box) { showMsg("棚番号を入力してください"); return false; }
   if (count.d !== today()) count = { d: today(), n: 0 };
@@ -434,7 +437,12 @@ $("start").addEventListener("click", async function () {
 
 // ---- 起動 ----
 loadLocal();
-if (!K) showMsg("専用URLから開いてください（合言葉がありません）。送信は行いません");
+const NO_KEY_MSG = "合言葉が無いため送信できません。読み取りはできます（この端末に保存）。専用URLで開き直すと送信します";
+if (!K) showMsg(NO_KEY_MSG);
+window.addEventListener("hashchange", function () {
+  const had = K; readKey();
+  if (K && !had) { showMsg(""); render(); pump(); }
+});
 render();
 if (navigator.storage && navigator.storage.persist) { navigator.storage.persist().catch(function () {}); }
 dbLoad().then(function (recs) {
