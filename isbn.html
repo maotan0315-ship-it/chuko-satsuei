@@ -563,8 +563,9 @@ async function startOcr() {
     const mod = await import(TJS + "tesseract.esm.min.js");
     const T = mod.createWorker ? mod : (mod.default || mod);
     ocrWorker = await T.createWorker("eng", 1, OCR_OPTS);
-    await ocrWorker.setParameters({ tessedit_pageseg_mode: "7", tessedit_char_whitelist: "ISBN0123456789-X", preserve_interword_spaces: "1" });
-    ocrPsm = "7";
+    // PSM 6（ブロック）。7（1行）は枠内にISBN行以外の文字や模様が入ると何も返さない（実物の写真で確認）
+    await ocrWorker.setParameters({ tessedit_pageseg_mode: "6", tessedit_char_whitelist: "ISBN0123456789-X", preserve_interword_spaces: "1" });
+    ocrPsm = "6";
     ocrState = "ready";
     window.__ocr = { prepForOcr, ocrRecognize, extractOcrIsbn, frameRect, detector, worker: ocrWorker };
     setTimeout(ocrLoop, OCR_MIN_GAP);
