@@ -17,6 +17,10 @@
   .cam { position: relative; width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 12px; overflow: hidden; }
   .cam video { width: 100%; height: 100%; object-fit: cover; }
   .frame { position: absolute; left: 8%; right: 8%; top: 38%; height: 24%; border: 3px solid #ffeb3b; border-radius: 8px; pointer-events: none; }
+  .hint { position: absolute; left: 8%; right: 8%; top: 38%; transform: translateY(-120%); text-align: center; font-size: 12px; color: #fff; text-shadow: 0 0 3px #000, 0 0 3px #000; pointer-events: none; }
+  .ocrrow { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; color: #555; }
+  .ocrrow button { border: 0; border-radius: 8px; background: #78909c; color: #fff; font-size: 13px; padding: 6px 10px; }
+  .ocrrow button:disabled { background: #b0bec5; }
   .flash { position: absolute; inset: 0; background: #00e676; opacity: 0; pointer-events: none; transition: opacity .4s; }
   .flash.on { opacity: .7; transition: none; }
   .btn { display: block; width: 100%; padding: 20px 0; margin-top: 10px; border: 0; border-radius: 14px; background: #1e88e5; color: #fff; font-size: 22px; font-weight: bold; }
@@ -50,8 +54,10 @@
   <div class="cam">
     <video id="v" playsinline muted autoplay></video>
     <div class="frame"></div>
+    <div class="hint">バーコード、またはISBNの数字の行を枠に入れてください</div>
     <div class="flash" id="flash"></div>
   </div>
+  <div class="ocrrow"><span>文字読み取り: <b id="ocrSt">未開始</b></span><button type="button" id="ocrTg" disabled>止める</button></div>
   <button class="btn" id="start">開始</button>
   <div class="msg" id="msg"></div>
   <div class="fatal" id="fatal"></div>
@@ -141,7 +147,42 @@ function parseManual(raw) {
   }
   return { error: "10桁か13桁で入力してください（今 " + s.length + " 桁）" };
 }
-window.__t = { isIsbn13, isIsbn10, isbn10to13, parseManual };
+
+// OCR文字列 -> {isbn, tagged} か null。parseManual とは別。誤登録防止のため日本の本（9784 / 4始まり）＋検算が合うものだけ
+function extractOcrIsbn(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let untagged = null;
+  for (const line of lines) {
+    const s = line
+      .replace(/[０-９Ａ-Ｚａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+      .toUpperCase().replace(/[×✕]/g, "X")
+      .replace(/[\s\-‐‑‒–—―ー－−­]/g, "");
+    // ISBN の直後（OCRで 1SBN / LSBN / ISBM になることがある）
+    const tagRe = /[I1L|!][S5$][B8][NM]/g;
+    let m;
+    while ((m = tagRe.exec(s))) {
+      const run = (s.slice(tagRe.lastIndex).match(/^[\dX]+/) || [""])[0];
+      const a = run.slice(0, 13);
+      if (a.length === 13 && /^9784\d{9}$/.test(a) && isIsbn13(a)) return { isbn: a, tagged: true };
+      const b = run.slice(0, 10);
+      if (b.length === 10 && /^4/.test(b) && isIsbn10(b)) return { isbn: isbn10to13(b), tagged: true };
+    }
+    // ISBN の文字が読めなかった行: 13桁は窓でずらして探す。10桁は4始まりでちょうど10桁のときだけ
+    if (!untagged) {
+      for (const run of s.match(/[\dX]+/g) || []) {
+        for (let i = 0; i + 13 <= run.length; i++) {
+          const a = run.slice(i, i + 13);
+          if (/^9784\d{9}$/.test(a) && isIsbn13(a)) { untagged = { isbn: a, tagged: false }; break; }
+        }
+        if (untagged) break;
+        // 10桁は並びがちょうど10桁のときだけ（JANコード491…等の先頭10桁を誤って拾わないため）
+        if (run.length === 10 && /^4/.test(run) && isIsbn10(run)) { untagged = { isbn: isbn10to13(run), tagged: false }; break; }
+      }
+    }
+  }
+  return untagged;
+}
+window.__t = { isIsbn13, isIsbn10, isbn10to13, parseManual, extractOcrIsbn };
 
 function newUuid() {
   if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
@@ -397,6 +438,19 @@ $("box").addEventListener("input", function () { safeSet("isbn_box", $("box").va
 // ---- カメラ読み取り ----
 // 同じISBNは「検出されなくなって1.5秒たってから」再び読めたら次の冊。かざしっぱなしでは増えない
 let lastRaw = null;
+let lastBarcodeAt = 0;     // 何かバーコードを検出した最後の時刻（OCRはこれが500ms以上前のときだけ動く）
+const detCanvas = document.createElement("canvas");
+const detCtx = detCanvas.getContext("2d");
+// 高解像度のカメラ映像はバーコード検出に重いので、検出側へは幅1280までに縮めて渡す
+function detSource() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!detCtx || !vw || !vh || Math.max(vw, vh) <= 1280) return video;
+  const k = 1280 / Math.max(vw, vh);
+  const dw = Math.round(vw * k), dh = Math.round(vh * k);
+  if (detCanvas.width !== dw || detCanvas.height !== dh) { detCanvas.width = dw; detCanvas.height = dh; }
+  detCtx.drawImage(video, 0, 0, detCanvas.width, detCanvas.height);
+  return detCanvas;
+}
 const lastSeen = {};       // isbn -> 最後に検出した時刻(ms)
 const armed = {};          // isbn -> false の間は確定済みで、外されるのを待っている
 async function loop() {
@@ -404,8 +458,9 @@ async function loop() {
   const t0 = performance.now();
   try {
     if (video.readyState >= 2) {
-      const res = await detector.detect(video);
+      const res = await detector.detect(detSource());
       const now = Date.now();
+      if (res.length) lastBarcodeAt = now;
       const found = res.map(r => r.rawValue).filter(isIsbn13);
       for (const k of Object.keys(armed)) if (armed[k] === false && now - (lastSeen[k] || 0) >= REARM_MS) armed[k] = true;
       const cand = found[0] || null;
@@ -419,6 +474,132 @@ async function loop() {
   setTimeout(loop, Math.max(0, 160 - (performance.now() - t0)));
 }
 
+// ---- 文字読み取り（OCR）。tesseract.js 7.0.0 を「開始」後に遅延読み込み。失敗してもバーコードは今まで通り ----
+const TJS = "https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/";
+const OCR_OPTS = {
+  workerPath: TJS + "worker.min.js",
+  corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@7.0.0",
+  langPath: "https://cdn.jsdelivr.net/npm/@tesseract.js-data/eng@1.0.0/4.0.0_best_int",
+  gzip: true,
+  logger: function () {},
+  errorHandler: function () {},
+};
+const OCR_MIN_GAP = 700;       // OCR開始間隔の下限(ms)。毎秒1.4回まで
+const OCR_QUIET = 500;         // 直近これだけバーコードが無いときだけ動く
+const OCR_HOLD = 2500;         // OCRで見えた本は、見えなくなってから 1.5+2.5 秒たつまで同じ本を数えない
+let ocrPrevStart = 0, ocrHold = OCR_HOLD;
+let ocrWorker = null, ocrState = "idle", ocrOn = true, ocrBusy = false, ocrLast = null, ocrPsm = "7";
+const ocrCanvas = document.createElement("canvas");
+function setOcrUi() {
+  const label = { idle: "未開始", loading: "準備中", ready: "使えます", failed: "使えません" }[ocrState];
+  $("ocrSt").textContent = label + (ocrState === "ready" && !ocrOn ? "（停止中）" : "");
+  const tg = $("ocrTg");
+  tg.disabled = ocrState !== "ready";
+  tg.textContent = ocrOn ? "止める" : "再開";
+}
+$("ocrTg").addEventListener("click", function () { ocrOn = !ocrOn; ocrLast = null; setOcrUi(); });
+
+// 黄色い枠（.frame）に当たる範囲を映像座標で返す（video は object-fit: cover）
+function frameRect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cam = video.parentElement, cw = cam.clientWidth || 4, ch = cam.clientHeight || 3;
+  const sc = Math.max(cw / vw, ch / vh);
+  const ox = (vw - cw / sc) / 2, oy = (vh - ch / sc) / 2;
+  const fl = 0.08, ft = 0.38, fw = 0.84, fh = 0.24;
+  return { x: ox + fl * cw / sc, y: oy + ft * ch / sc, w: fw * cw / sc, h: fh * ch / sc };
+}
+// 切り出し -> 幅約OCR_W に拡大縮小 -> グレースケール -> 局所平均で二値化（影・ムラに強い）
+const OCR_W = 1100;
+function prepForOcr(src, r) {
+  const k = Math.min(3, OCR_W / r.w);
+  const w = Math.max(1, Math.round(r.w * k)), h = Math.max(1, Math.round(r.h * k));
+  ocrCanvas.width = w; ocrCanvas.height = h;
+  const c = ocrCanvas.getContext("2d", { willReadFrequently: true });
+  c.imageSmoothingEnabled = true; c.imageSmoothingQuality = "high";
+  c.drawImage(src, r.x, r.y, r.w, r.h, 0, 0, w, h);
+  const img = c.getImageData(0, 0, w, h), d = img.data;
+  const g = new Float32Array(w * h);
+  for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = d[j] * 0.299 + d[j + 1] * 0.587 + d[j + 2] * 0.114;
+  // 積分画像
+  const W = w + 1, I = new Float64Array(W * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    for (let x = 0; x < w; x++) { row += g[y * w + x]; I[(y + 1) * W + x + 1] = I[y * W + x + 1] + row; }
+  }
+  const R = Math.max(8, Math.round(h / 4));      // 局所窓の半径
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1);
+      const mean = (I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0]) / ((x1 - x0) * (y1 - y0));
+      const v = g[y * w + x] < mean * 0.85 ? 0 : 255;
+      const j = (y * w + x) * 4; d[j] = d[j + 1] = d[j + 2] = v; d[j + 3] = 255;
+    }
+  }
+  return bmp24(img);
+}
+// canvas.toBlob(PNG) は遅いことがあるので、24bit BMP を自前で作って渡す（tesseract.js が読める）
+function bmp24(img) {
+  const w = img.width, h = img.height, d = img.data, rs = (w * 3 + 3) & ~3, sz = 54 + rs * h;
+  const b = new Uint8Array(sz), v = new DataView(b.buffer);
+  b[0] = 66; b[1] = 77; v.setUint32(2, sz, true); v.setUint32(10, 54, true); v.setUint32(14, 40, true);
+  v.setInt32(18, w, true); v.setInt32(22, h, true); v.setUint16(26, 1, true); v.setUint16(28, 24, true); v.setUint32(34, rs * h, true);
+  for (let y = 0; y < h; y++) {
+    let o = 54 + (h - 1 - y) * rs;
+    for (let x = 0; x < w; x++) { const j = (y * w + x) * 4; b[o++] = d[j + 2]; b[o++] = d[j + 1]; b[o++] = d[j]; }
+  }
+  return b;
+}
+async function ocrRecognize(bytes, psm) {
+  if (psm && psm !== ocrPsm) { await ocrWorker.setParameters({ tessedit_pageseg_mode: psm }); ocrPsm = psm; }
+  const r = await ocrWorker.recognize(bytes);
+  return r.data.text || "";
+}
+window.__startOcr = () => startOcr();
+async function startOcr() {
+  if (ocrState !== "idle") return;
+  ocrState = "loading"; setOcrUi();
+  try {
+    const mod = await import(TJS + "tesseract.esm.min.js");
+    const T = mod.createWorker ? mod : (mod.default || mod);
+    ocrWorker = await T.createWorker("eng", 1, OCR_OPTS);
+    await ocrWorker.setParameters({ tessedit_pageseg_mode: "7", tessedit_char_whitelist: "ISBN0123456789-X", preserve_interword_spaces: "1" });
+    ocrPsm = "7";
+    ocrState = "ready";
+    window.__ocr = { prepForOcr, ocrRecognize, extractOcrIsbn, frameRect, detector, worker: ocrWorker };
+    setTimeout(ocrLoop, OCR_MIN_GAP);
+  } catch (e) {
+    ocrState = "failed"; ocrWorker = null;
+  }
+  setOcrUi();
+}
+async function ocrLoop() {
+  const t0 = Date.now();
+  if (ocrState === "ready" && ocrOn && running && !ocrBusy && !document.hidden && video.readyState >= 2 && video.videoWidth && t0 - lastBarcodeAt >= OCR_QUIET) {
+    ocrBusy = true;
+    // 端末が遅くてOCRの間隔が延びても、同じ本を数え直さないよう保持時間を間隔の2倍（2.5〜5秒）に合わせる
+    if (ocrPrevStart) ocrHold = Math.min(5000, Math.max(OCR_HOLD, 2 * (t0 - ocrPrevStart)));
+    ocrPrevStart = t0;
+    try {
+      const text = await ocrRecognize(prepForOcr(video, frameRect()));
+      const now = Date.now();
+      const ex = extractOcrIsbn(text);
+      if (ex && now - lastBarcodeAt >= OCR_QUIET) {
+        const isbn = ex.isbn;
+        // 同じ本を数え続けない: バーコードと同じ armed / lastSeen を共用（OCRは見えている間 lastSeen を未来側へ延ばす）
+        for (const k of Object.keys(armed)) if (armed[k] === false && now - (lastSeen[k] || 0) >= REARM_MS) armed[k] = true;
+        lastSeen[isbn] = now + ocrHold;
+        if (ocrLast === isbn && armed[isbn] !== false) {
+          if (accept(isbn)) armed[isbn] = false;
+          ocrLast = null;
+        } else ocrLast = isbn;
+      } else ocrLast = null;
+    } catch (e) { ocrLast = null; }
+    ocrBusy = false;
+  }
+  setTimeout(ocrLoop, Math.max(100, OCR_MIN_GAP - (Date.now() - t0)));
+}
+
 $("start").addEventListener("click", async function () {
   showMsg("");
   if (!getBox()) { showMsg("先に棚番号を入力してください"); $("box").focus(); return; }
@@ -429,10 +610,11 @@ $("start").addEventListener("click", async function () {
   } catch (e) {}
   try {
     if (stream) stream.getTracks().forEach(t => t.stop());
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
     video.srcObject = stream;
     await video.play();
     if (!running) { running = true; loop(); }
+    startOcr();
     $("start").textContent = "再開始";
   } catch (e) {
     showMsg("カメラを使えません: " + (e && e.message || e));
